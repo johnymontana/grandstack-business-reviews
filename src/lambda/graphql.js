@@ -2,6 +2,16 @@ const { ApolloServer } = require("apollo-server-lambda");
 const neo4j = require("neo4j-driver");
 const { makeAugmentedSchema } = require("neo4j-graphql-js");
 const jwt = require("jsonwebtoken");
+const jwks = require("jwks-rsa")
+
+const client = jwks({jwksUri: `https://${process.env.AUTH0_DOMAIN}/.well-known/jwks.json`})
+
+const getPublicKey = (header, callback) => {
+    client.getSigningKey(header.kid, (err, key) => {
+        const publicKey = key.publicKey || key.rsaPublicKey;
+        callback(null, publicKey)
+    })
+}
 
 const resolvers = {
   Business: {
@@ -51,7 +61,6 @@ const typeDefs = /* GraphQL */ `
     businessId: ID!
     waitTime: Int! @neo4j_ignore
     averageStars: Float!
-      @isAuthenticated
       @cypher(
         statement: "MATCH (this)<-[:REVIEWS]-(r:Review) RETURN avg(r.stars)"
       )
@@ -72,12 +81,7 @@ const typeDefs = /* GraphQL */ `
     categories: [Category] @relation(name: "IN_CATEGORY", direction: OUT)
   }
 
-  enum Role {
-    USER
-    ADMIN
-  }
-
-  type User @hasRole(roles: [ADMIN]) {
+  type User {
     userID: ID!
     name: String!
     reviews: [Review] @relation(name: "WROTE", direction: OUT)
@@ -102,14 +106,7 @@ const schema = makeAugmentedSchema({
   typeDefs,
   resolvers,
   config: {
-    mutation: true,
-    query: {
-      exclude: ["MySecretType"],
-    },
-    auth: {
-      isAuthenticated: true,
-      hasRole: true,
-    },
+    mutation: false,
   },
 });
 
@@ -120,21 +117,41 @@ const driver = neo4j.driver(
 
 const server = new ApolloServer({
   schema,
-  context: ({ event }) => {
+  context: async ({ event }) => {
     const token = event.headers?.authorization?.slice(7);
     let userId;
 
-    if (token) {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET, {
-        algorithms: ["RS256"],
-      });
-      userId = decoded.sub;
+    if (!token) {
+        return {
+            driver
+        }
     }
+
+    const authResult = new Promise((resolve, reject) => {
+        jwt.verify(
+            token,
+            getPublicKey, {
+                algorithms: ["RS256"]
+            },
+            (error, decoded) => {
+                if (error) {
+                    reject({error})
+                }
+                if (decoded) {
+                    resolve(decoded)
+                }
+            }
+        )
+    })
+
+    const decoded = await authResult;
+
+    
     return {
       driver,
       req: event,
       cypherParams: {
-        userId,
+        userId: decoded.sub,
       },
     };
   },
